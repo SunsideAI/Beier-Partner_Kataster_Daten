@@ -246,6 +246,73 @@ def kataster_lookup(
     return JSONResponse(content=result)
 
 
+@app.post("/pipedrive/webhook")
+async def pipedrive_webhook(
+    payload: dict,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Empfängt Pipedrive-Webhooks und schreibt Katasterdaten zurück in den Deal.
+
+    Pipedrive sendet bei Deal-Ereignissen (created/updated) einen POST mit:
+      payload["current"]["id"]                     → Deal-ID
+      payload["current"][PIPEDRIVE_ADDRESS_FIELD_KEY] → Adresse
+
+    Konfiguration:
+      PIPEDRIVE_ADDRESS_FIELD_KEY  Pipedrive custom field key des Adressfelds
+      PIPEDRIVE_API_TOKEN          Pipedrive API Token
+      PIPEDRIVE_COMPANY_DOMAIN     z.B. "beierpartner"
+      PIPEDRIVE_FIELD_MAP          JSON-Map Kataster-Feld → Pipedrive custom field key
+
+    Beispiel curl zum Testen:
+      curl -X POST -H "X-API-Key: KEY" -H "Content-Type: application/json" \\
+        -d '{"current":{"id":123,"ADRESS_FIELD_KEY":"Musterstr. 1, 21680 Stade"}}' \\
+        http://localhost:8000/pipedrive/webhook
+    """
+    from pipedrive_client import update_deal_fields
+
+    address_field_key = os.environ.get("PIPEDRIVE_ADDRESS_FIELD_KEY", "")
+    if not address_field_key:
+        logger.error("PIPEDRIVE_ADDRESS_FIELD_KEY nicht konfiguriert")
+        raise HTTPException(status_code=500, detail="PIPEDRIVE_ADDRESS_FIELD_KEY nicht konfiguriert")
+
+    current = payload.get("current", {})
+    deal_id = current.get("id")
+    adresse = current.get(address_field_key, "")
+
+    if not deal_id or not adresse:
+        logger.info("Webhook: deal_id oder Adresse fehlt — übersprungen")
+        return {"status": "skipped", "reason": "deal_id oder Adresse fehlt"}
+
+    logger.info("Webhook: Deal %s, Adresse '%s'", deal_id, adresse)
+
+    geo = geocode(adresse)
+    if not geo:
+        logger.warning("Webhook: Adresse nicht geokodierbar: %s", adresse)
+        return {"status": "skipped", "reason": "Adresse nicht gefunden"}
+
+    if not is_supported(geo.bundesland):
+        logger.info("Webhook: Bundesland '%s' nicht unterstützt", geo.bundesland)
+        return {"status": "skipped", "reason": f"Bundesland '{geo.bundesland}' nicht unterstützt"}
+
+    client = CLIENTS.get(geo.bundesland)
+    if not client:
+        return {"status": "error", "reason": f"Kein Client für {geo.bundesland}"}
+
+    flurstuecke = client.query_flurstuecke(geo.lat, geo.lon, adresse=adresse)
+    if not flurstuecke:
+        logger.warning("Webhook: Kein Flurstück gefunden für %s", adresse)
+        return {"status": "not_found", "reason": "Kein Flurstück an dieser Position"}
+
+    kataster_data = flurstuecke[0].to_dict()
+    kataster_data["bundesland"] = geo.bundesland
+
+    success = update_deal_fields(int(deal_id), kataster_data)
+    status = "ok" if success else "error"
+    logger.info("Webhook: Deal %s → %s", deal_id, status)
+    return {"status": status, "deal_id": deal_id}
+
+
 @app.get("/health")
 def health_check():
     """Einfacher Health-Check für Monitoring."""
