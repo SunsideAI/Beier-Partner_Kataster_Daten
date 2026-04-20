@@ -13,8 +13,9 @@ import logging
 from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Security, Depends
 from fastapi.responses import JSONResponse
+from fastapi.security.api_key import APIKeyHeader
 
 load_dotenv()  # no-op in production (Railway sets env vars directly)
 
@@ -23,6 +24,33 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────
+# API Key Auth
+# ──────────────────────────────────────────────
+
+_VALID_KEYS: set[str] = {
+    k.strip()
+    for k in os.environ.get("API_KEYS", "").split(",")
+    if k.strip()
+}
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str = Security(_api_key_header)) -> str:
+    """FastAPI dependency. Raises 401 for invalid/missing key.
+    If API_KEYS env var is unset, auth is disabled (local dev convenience).
+    """
+    if not _VALID_KEYS:
+        return ""
+    if not api_key or api_key not in _VALID_KEYS:
+        raise HTTPException(
+            status_code=401,
+            detail={"fehler": "Ungültiger oder fehlender API-Key", "header": "X-API-Key"},
+        )
+    return api_key
+
 
 from geocoder import geocode, is_supported, SUPPORTED_STATES
 from wfs_clients import FlurstueckInfo
@@ -65,7 +93,7 @@ CLIENTS = {
 # ──────────────────────────────────────────────
 
 @app.get("/")
-def root():
+def root(api_key: str = Depends(verify_api_key)):
     """Startseite / Health-Check."""
     return {
         "service": "Kataster-Lookup-Service",
@@ -87,6 +115,7 @@ def kataster_lookup(
         False,
         description="Wenn true, wird zusätzlich die Gebäudegrundfläche abgefragt.",
     ),
+    api_key: str = Depends(verify_api_key),
 ):
     """
     Ermittelt Katasterdaten anhand einer Adresse.
