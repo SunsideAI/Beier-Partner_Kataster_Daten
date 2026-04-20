@@ -325,6 +325,29 @@ def kataster_lookup(
 
     logger.info("Geocoder: %.6f, %.6f (%s, %s)", geo.lat, geo.lon, geo.bundesland, geo.ort)
 
+    # Schritt 1b: Hausnummer-Check — verhindert falsche Flurstücke bei ländlichen Adressen
+    if not geo.house_number_matched:
+        logger.warning(
+            "Adresse unvollstaendig aufgeloest: '%s' → '%s' (addresstype=%s, erwartet=%s, nominatim=%s)",
+            adresse, geo.display_name, geo.addresstype,
+            geo.expected_house_number, geo.nominatim_house_number,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "address_incomplete",
+                "fehler": "Hausnummer konnte nicht eindeutig aufgelöst werden",
+                "adresse": adresse,
+                "aufgeloeste_adresse": geo.display_name,
+                "koordinaten": {"lat": geo.lat, "lon": geo.lon},
+                "hinweis": (
+                    "Die angegebene Hausnummer wurde in der Adressdatenbank nicht gefunden. "
+                    "Im ländlichen Raum sind Hausnummern nicht immer vollständig erfasst. "
+                    "Bitte Katasterdaten manuell im Geoportal des Bundeslands recherchieren."
+                ),
+            },
+        )
+
     # Schritt 2: Bundesland prüfen
     if not is_supported(geo.bundesland):
         raise HTTPException(
@@ -484,6 +507,18 @@ async def pipedrive_webhook(
     if not geo:
         logger.warning("Webhook: Adresse nicht geokodierbar: %s", adresse)
         return {"status": "skipped", "reason": "Adresse nicht gefunden"}
+
+    if not geo.house_number_matched:
+        logger.warning(
+            "Webhook: Deal %s — Hausnummer nicht aufgeloest: '%s' (addresstype=%s)",
+            deal_id, adresse, geo.addresstype,
+        )
+        return {
+            "status": "address_incomplete",
+            "reason": "Hausnummer konnte nicht eindeutig aufgelöst werden",
+            "deal_id": deal_id,
+            "aufgeloeste_adresse": geo.display_name,
+        }
 
     if not is_supported(geo.bundesland):
         logger.info("Webhook: Bundesland '%s' nicht unterstützt", geo.bundesland)
