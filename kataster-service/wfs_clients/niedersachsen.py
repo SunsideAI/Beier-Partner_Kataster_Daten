@@ -3,11 +3,14 @@ WFS-Client für Niedersachsen (LGLN).
 Endpunkt: ALKIS WFS vereinfacht (einfach)
 """
 
+import logging
 import requests
 from lxml import etree
 from typing import Optional, List
 from wfs_clients import WFSClient, FlurstueckInfo
 from coordinates import make_bbox_utm32
+
+logger = logging.getLogger(__name__)
 
 # Niedersachsen ALKIS WFS Endpunkte
 WFS_FLURSTUECK_URL = "https://opendata.lgln.niedersachsen.de/doorman/noauth/alkis_wfs_einfach"
@@ -130,7 +133,7 @@ class NiedersachsenClient(WFSClient):
             response.raise_for_status()
             return self._parse_all_flurstuecke(response.content)
         except requests.RequestException as e:
-            print(f"[NI] WFS KVP-Fehler: {e}")
+            logger.warning("[NI] WFS KVP-Fehler: %s", e)
             return []
 
     def _query_xml_all(self, bbox: tuple) -> List[FlurstueckInfo]:
@@ -153,7 +156,7 @@ class NiedersachsenClient(WFSClient):
             response.raise_for_status()
             return self._parse_all_flurstuecke(response.content)
         except requests.RequestException as e:
-            print(f"[NI] WFS XML-Fehler: {e}")
+            logger.warning("[NI] WFS XML-Fehler: %s", e)
             return []
 
     @staticmethod
@@ -174,7 +177,7 @@ class NiedersachsenClient(WFSClient):
         input_suffix = (match.group(2) or "").upper()
         input_full = f"{input_number}{input_suffix}".strip()
 
-        print(f"[NI] Adress-Matching: suche Hausnummer '{input_full}' in {len(results)} Flurstücken")
+        logger.info("[NI] Adress-Matching: suche Hausnummer '%s' in %d Flurstuecken", input_full, len(results))
 
         best_match = None
         best_score = -1
@@ -193,13 +196,13 @@ class NiedersachsenClient(WFSClient):
 
                 if lage_full == input_full:
                     # Exakter Treffer (Hausnummer + Zusatz)
-                    print(f"[NI]   Exakter Treffer: '{lage}' → {info.flurstueck_display}")
+                    logger.info("[NI]   Exakter Treffer: '%s' → %s", lage, info.flurstueck_display)
                     return info
                 elif num == input_number and best_score < 1:
                     # Hausnummer stimmt, Zusatz nicht — zweitbestes Match
                     best_match = info
                     best_score = 1
-                    print(f"[NI]   Teilmatch (nur Nummer): '{lage}' → {info.flurstueck_display}")
+                    logger.info("[NI]   Teilmatch (nur Nummer): '%s' → %s", lage, info.flurstueck_display)
 
         return best_match
 
@@ -208,14 +211,14 @@ class NiedersachsenClient(WFSClient):
         try:
             root = etree.fromstring(xml_content)
         except etree.XMLSyntaxError as e:
-            print(f"[NI] XML-Parse-Fehler: {e}")
+            logger.warning("[NI] XML-Parse-Fehler: %s", e)
             return []
 
         # Prüfe auf ExceptionReport
         if "ExceptionReport" in root.tag or root.find(".//{http://www.opengis.net/ows/1.1}ExceptionReport") is not None:
             exc_text = root.find(".//{http://www.opengis.net/ows/1.1}ExceptionText")
             msg = exc_text.text if exc_text is not None else "Unbekannter WFS-Fehler"
-            print(f"[NI] WFS-Exception: {msg}")
+            logger.warning("[NI] WFS-Exception: %s", msg)
             return []
 
         # Suche nach Flurstück-Elementen
@@ -224,10 +227,10 @@ class NiedersachsenClient(WFSClient):
             members = root.findall(".//ave:Flurstueck", NS)
 
         if not members:
-            print(f"[NI] Keine Flurstücke in der Antwort gefunden.")
+            logger.info("[NI] Keine Flurstücke in der Antwort gefunden.")
             return []
 
-        print(f"[NI] {len(members)} Flurstück(e) in der Antwort")
+        logger.info("[NI] %d Flurstück(e) in der Antwort", len(members))
         results = []
 
         for flst in members:
@@ -296,15 +299,22 @@ class NiedersachsenClient(WFSClient):
             "aktualit", "ave:aktualit",
         ])
 
-        print(f"[NI]   → {info.gemarkung} Flur {info.flur} "
-              f"Flurstück {info.flurstueck_display} "
-              f"({info.flaeche_display}) Lage: {info.lagebezeichnung}")
+        logger.info("[NI]   → %s Flur %s Flurstück %s (%s) Lage: %s",
+                    info.gemarkung, info.flur, info.flurstueck_display,
+                    info.flaeche_display, info.lagebezeichnung)
         return info
 
     def query_gebaeude(self, lat: float, lon: float) -> Optional[float]:
-        """Ermittelt die Gebäudegrundfläche am Standort."""
-        # Größere BBOX für Gebäude (ein Gebäude kann versetzt zum Punkt liegen)
-        bbox = make_bbox_utm32(lon, lat, buffer_m=5.0)
+        """Ermittelt die Gebäudegrundfläche am Standort.
+
+        Bekannte Einschränkung: ave:Gebaeude ist im LGLN vereinfacht-Schema
+        enthalten, aber der Dienst liefert abhängig von der BBOX-Größe und
+        dem genauen Geocoding-Punkt nicht immer ein Ergebnis. Bei null-Return
+        ist das Feld gebaeude_grundflaeche_qm im Response null.
+        """
+        # 30m Buffer: Gebäude-Polygon liegt häufig versetzt zum Adresspunkt
+        # (Nominatim geocodiert oft an die Straßenseite, nicht die Gebäudemitte)
+        bbox = make_bbox_utm32(lon, lat, buffer_m=30.0)
         min_east, min_north, max_east, max_north = bbox
 
         xml_body = GET_GEBAEUDE_TEMPLATE.format(
@@ -314,6 +324,8 @@ class NiedersachsenClient(WFSClient):
             max_north=max_north,
         )
 
+        logger.debug("[NI] Gebaeude-BBOX utm32: %.1f %.1f %.1f %.1f", *bbox)
+
         try:
             response = requests.post(
                 WFS_FLURSTUECK_URL,
@@ -322,9 +334,14 @@ class NiedersachsenClient(WFSClient):
                 timeout=30,
             )
             response.raise_for_status()
-            return self._parse_gebaeude_flaeche(response.content)
+            logger.debug("[NI] Gebaeude-Response (%d bytes): %s",
+                         len(response.content), response.content[:400])
+            result = self._parse_gebaeude_flaeche(response.content)
+            if result is None:
+                logger.info("[NI] Gebaeude: kein Treffer in BBOX (ave:Gebaeude liefert 0 Members)")
+            return result
         except requests.RequestException as e:
-            print(f"[NI] Gebäude-Abfrage-Fehler: {e}")
+            logger.warning("[NI] Gebaeude-Abfrage-Fehler: %s", e)
             return None
 
     def _parse_gebaeude_flaeche(self, xml_content: bytes) -> Optional[float]:
