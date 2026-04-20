@@ -89,6 +89,22 @@ CLIENTS = {
 
 
 # ──────────────────────────────────────────────
+# Hilfsfunktionen
+# ──────────────────────────────────────────────
+
+def _format_flurstueck_text(d: dict) -> str:
+    """Erzeugt einen lesbaren String für ein Flurstück (für Pipedrive-Textfelder)."""
+    parts = []
+    if d.get("gemarkung"):
+        parts.append(f"Gemarkung {d['gemarkung']}")
+    if d.get("flur"):
+        parts.append(f"Flur {d['flur']}")
+    if d.get("flurstueck"):
+        parts.append(f"Flurstück {d['flurstueck']}")
+    return ", ".join(parts) or "unbekannt"
+
+
+# ──────────────────────────────────────────────
 # API Endpunkte
 # ──────────────────────────────────────────────
 
@@ -198,6 +214,12 @@ def kataster_lookup(
     # Ergebnis zusammenstellen
     kataster_list = [f.to_dict() for f in flurstuecke]
 
+    weitere_text = None
+    if len(kataster_list) > 1:
+        weitere_text = "; ".join(
+            _format_flurstueck_text(f) for f in kataster_list[1:]
+        )
+
     result = {
         "status": "ok",
         "abfrage": {
@@ -207,9 +229,11 @@ def kataster_lookup(
             "ort": geo.ort,
             "plz": geo.plz,
         },
+        "bundesland": geo.bundesland,
         "anzahl_flurstuecke": len(kataster_list),
-        "kataster": kataster_list[0],  # Erstes Ergebnis (Abwärtskompatibilität)
-        "kataster_ergebnisse": kataster_list,  # Alle Treffer
+        "weitere_flurstuecke_text": weitere_text,
+        "kataster": kataster_list[0],  # Abwärtskompatibilität; bevorzuge kataster_ergebnisse[0]
+        "kataster_ergebnisse": kataster_list,
         "zeitstempel": timestamp,
     }
 
