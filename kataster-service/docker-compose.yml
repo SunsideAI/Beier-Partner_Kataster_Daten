@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  kataster:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      API_KEYS: "localdev-secret"
+    env_file:
+      - .env   # optional: overrides above if .env exists
