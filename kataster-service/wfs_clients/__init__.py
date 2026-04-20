@@ -7,6 +7,28 @@ from typing import Optional, List, List
 from abc import ABC, abstractmethod
 
 
+def _clean_nutzungsart(raw: Optional[str]) -> Optional[str]:
+    """Entfernt angehängte Flächenangaben und ALKIS-Funktionscodes aus tntxt.
+    Beispiele: "Wohnbaufläche;594" → "Wohnbaufläche"
+               "Straßenverkehr(funktion:null);97" → "Straßenverkehr"
+    """
+    if not raw:
+        return raw
+    return raw.split(";")[0].split("(")[0].strip() or None
+
+
+def _clean_aktualitaet(raw: Optional[str]) -> Optional[str]:
+    """Entfernt das Z-Suffix von reinen Datumsangaben ohne Uhrzeit.
+    Beispiel: "2025-08-07Z" → "2025-08-07"
+              "2025-08-07T00:00:00Z" → unverändert (gültiges ISO-Datetime)
+    """
+    if not raw:
+        return raw
+    if "T" not in raw and raw.endswith("Z"):
+        return raw[:-1]
+    return raw
+
+
 @dataclass
 class FlurstueckInfo:
     """Katasterdaten eines Flurstücks."""
@@ -60,8 +82,8 @@ class FlurstueckInfo:
             "lagebezeichnung": self.lagebezeichnung,
             "gemeinde": self.gemeinde,
             "kreis": self.kreis,
-            "nutzungsart": self.nutzungsart,
-            "aktualitaet": self.aktualitaet,
+            "nutzungsart": _clean_nutzungsart(self.nutzungsart),
+            "aktualitaet": _clean_aktualitaet(self.aktualitaet),
             "quelle": self.quelle,
             "bundesland": self.bundesland,
         }
