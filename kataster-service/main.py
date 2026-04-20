@@ -267,6 +267,21 @@ def _extract_address(field_value) -> str:
     return ", ".join(parts)
 
 
+# Debug-Endpoint-Flag
+_DEBUG_ENDPOINT_ENABLED = os.environ.get("ENABLE_DEBUG_ENDPOINT", "").lower() == "true"
+
+
+def _geocoder_debug(geo) -> dict:
+    """Baut den debug-Block aus einem GeocodingResult."""
+    return {
+        "geocoder_query_mode": geo.query_mode,
+        "nominatim_addresstype": geo.addresstype,
+        "nominatim_house_number": geo.nominatim_house_number,
+        "expected_house_number": geo.expected_house_number,
+        "house_number_matched": geo.house_number_matched,
+    }
+
+
 # ──────────────────────────────────────────────
 # API Endpunkte
 # ──────────────────────────────────────────────
@@ -324,6 +339,29 @@ def kataster_lookup(
         )
 
     logger.info("Geocoder: %.6f, %.6f (%s, %s)", geo.lat, geo.lon, geo.bundesland, geo.ort)
+
+    # Schritt 1b: Hausnummer-Check — verhindert falsche Flurstücke bei ländlichen Adressen
+    if not geo.house_number_matched:
+        logger.warning(
+            "Adresse unvollstaendig aufgeloest: '%s' → '%s' (addresstype=%s, erwartet=%s, nominatim=%s)",
+            adresse, geo.display_name, geo.addresstype,
+            geo.expected_house_number, geo.nominatim_house_number,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "address_incomplete",
+                "fehler": "Hausnummer konnte nicht eindeutig aufgelöst werden",
+                "adresse": adresse,
+                "aufgeloeste_adresse": geo.display_name,
+                "koordinaten": {"lat": geo.lat, "lon": geo.lon},
+                "hinweis": (
+                    "Die angegebene Hausnummer wurde in der Adressdatenbank nicht gefunden. "
+                    "Im ländlichen Raum sind Hausnummern nicht immer vollständig erfasst. "
+                    "Bitte Katasterdaten manuell im Geoportal des Bundeslands recherchieren."
+                ),
+            },
+        )
 
     # Schritt 2: Bundesland prüfen
     if not is_supported(geo.bundesland):
@@ -485,6 +523,18 @@ async def pipedrive_webhook(
         logger.warning("Webhook: Adresse nicht geokodierbar: %s", adresse)
         return {"status": "skipped", "reason": "Adresse nicht gefunden"}
 
+    if not geo.house_number_matched:
+        logger.warning(
+            "Webhook: Deal %s — Hausnummer nicht aufgeloest: '%s' (addresstype=%s)",
+            deal_id, adresse, geo.addresstype,
+        )
+        return {
+            "status": "address_incomplete",
+            "reason": "Hausnummer konnte nicht eindeutig aufgelöst werden",
+            "deal_id": deal_id,
+            "aufgeloeste_adresse": geo.display_name,
+        }
+
     if not is_supported(geo.bundesland):
         logger.info("Webhook: Bundesland '%s' nicht unterstützt", geo.bundesland)
         return {"status": "skipped", "reason": f"Bundesland '{geo.bundesland}' nicht unterstützt"}
@@ -505,6 +555,98 @@ async def pipedrive_webhook(
     status = "ok" if success else "error"
     logger.info("Webhook: Deal %s → %s", deal_id, status)
     return {"status": status, "deal_id": deal_id}
+
+
+@app.get("/test-adresse")
+def test_adresse(
+    adresse: str = Query(..., description="Zu testende Adresse", min_length=5),
+    gebaeude: bool = Query(False),
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Wie /kataster, aber mit zusätzlichem debug-Block im Response.
+    Zeigt warum Nominatim die Hausnummer (nicht) aufgelöst hat.
+
+    Nur aktiv wenn ENABLE_DEBUG_ENDPOINT=true gesetzt ist.
+    Nützlich für Feldtests ohne Railway-Log-Zugriff.
+    """
+    if not _DEBUG_ENDPOINT_ENABLED:
+        raise HTTPException(status_code=404, detail="Debug-Endpoint nicht aktiv (ENABLE_DEBUG_ENDPOINT=true setzen)")
+
+    timestamp = datetime.now().isoformat()
+    logger.info("Test-Abfrage: %s", adresse)
+
+    geo = geocode(adresse)
+    if not geo:
+        return JSONResponse(status_code=404, content={
+            "status": "geocoding_failed",
+            "adresse": adresse,
+            "debug": {"geocoder_query_mode": None, "nominatim_addresstype": None,
+                      "nominatim_house_number": None, "expected_house_number": None,
+                      "house_number_matched": None},
+        })
+
+    debug = _geocoder_debug(geo)
+
+    if not geo.house_number_matched:
+        return JSONResponse(status_code=422, content={
+            "status": "address_incomplete",
+            "fehler": "Hausnummer konnte nicht eindeutig aufgelöst werden",
+            "adresse": adresse,
+            "aufgeloeste_adresse": geo.display_name,
+            "koordinaten": {"lat": geo.lat, "lon": geo.lon},
+            "debug": debug,
+        })
+
+    if not is_supported(geo.bundesland):
+        return JSONResponse(status_code=422, content={
+            "status": "bundesland_not_supported",
+            "bundesland": geo.bundesland,
+            "debug": debug,
+        })
+
+    client = CLIENTS.get(geo.bundesland)
+    if not client:
+        return JSONResponse(status_code=500, content={"status": "error", "debug": debug})
+
+    flurstuecke = client.query_flurstuecke(geo.lat, geo.lon, adresse=adresse)
+    if not flurstuecke:
+        return JSONResponse(status_code=404, content={
+            "status": "not_found",
+            "fehler": "Kein Flurstück an dieser Position",
+            "adresse": adresse,
+            "koordinaten": {"lat": geo.lat, "lon": geo.lon},
+            "bundesland": geo.bundesland,
+            "debug": debug,
+        })
+
+    if gebaeude:
+        gf = client.query_gebaeude(geo.lat, geo.lon)
+        if gf:
+            flurstuecke[0].gebaeude_grundflaeche = gf
+
+    kataster_list = [f.to_dict() for f in flurstuecke]
+    weitere_text = None
+    if len(kataster_list) > 1:
+        weitere_text = "; ".join(_format_flurstueck_text(f) for f in kataster_list[1:])
+
+    return JSONResponse(content={
+        "status": "ok",
+        "debug": debug,
+        "abfrage": {
+            "adresse": adresse,
+            "aufgeloeste_adresse": geo.display_name,
+            "koordinaten": {"lat": geo.lat, "lon": geo.lon},
+            "ort": geo.ort,
+            "plz": geo.plz,
+        },
+        "bundesland": geo.bundesland,
+        "anzahl_flurstuecke": len(kataster_list),
+        "weitere_flurstuecke_text": weitere_text,
+        "kataster": kataster_list[0],
+        "kataster_ergebnisse": kataster_list,
+        "zeitstempel": timestamp,
+    })
 
 
 @app.get("/health")
